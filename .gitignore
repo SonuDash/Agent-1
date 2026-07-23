@@ -1,0 +1,23 @@
+# Secrets — never commit these
+.env
+credentials.json
+token.json
+
+# Local conversation history — personal data, not for the repo
+agent_log.db
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+build/
+dist/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
