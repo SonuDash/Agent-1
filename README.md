@@ -14,7 +14,7 @@ be making anyway) - the LLM inference itself is 100% local.
 
 ## 0. Prerequisites
 
-- macOS on Apple Silicon (M1/M2/M3/M4)
+- macOS on Apple Silicon (>=M3)
 - Python 3.10+
 - ~10GB free disk space
 
