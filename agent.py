@@ -4,12 +4,14 @@ OpenAI-style tool calling to reach into Gmail, Calendar, and Notion.
 Run: python agent.py
 """
 import json
+import re
+import sys
 from datetime import datetime
 
 import requests
 
 import config
-from tools.gmail_tools import get_recent_emails, search_emails, create_email_draft, send_email
+from tools.gmail_tools import get_recent_emails, search_emails, create_email_draft, send_email, create_reply_draft, send_reply
 from tools.calendar_tools import list_upcoming_events, create_calendar_event, delete_calendar_event
 from tools.notion_tools import search_notion, get_page_content
 from storage import log_interaction, search_log
@@ -35,12 +37,22 @@ comes up empty, call search_notion with no query instead of guessing more
 keywords - that lists everything the integration can currently see in one
 call.
 
-Grounding rule - follow this strictly: if the user asks about a specific
-email, event, or page and your tool results do NOT contain something that
-actually matches (matching subject, sender, or title), say plainly that you
-couldn't find it and show what you searched for. NEVER summarize or describe
-a different, unrelated item as if it were the one requested. Getting this
-wrong is worse than saying "not found."
+Grounding rule (search) - follow this strictly: if the user asks about a
+specific email, event, or page and your tool results do NOT contain
+something that actually matches (matching subject, sender, or title), say
+plainly that you couldn't find it and show what you searched for. NEVER
+summarize or describe a different, unrelated item as if it were the one
+requested. Getting this wrong is worse than saying "not found."
+
+Grounding rule (actions) - follow this even more strictly: NEVER tell the
+user something was created, sent, deleted, or updated unless you can see the
+actual successful result of that exact tool call earlier in THIS
+conversation. If you have not called send_email, create_calendar_event,
+delete_calendar_event, etc. and gotten a success result back, you have not
+done it - don't say you have, don't invent an ID or confirmation detail for
+it, and don't describe what "would have" happened as if it happened. If a
+tool call errored, say so plainly and show the error, don't paper over it
+with a fabricated success message.
 
 Deleting calendar events is destructive and cannot be undone. Before calling
 delete_calendar_event, always state clearly which event (title + date/time)
@@ -62,6 +74,33 @@ user's real name given above - NEVER leave a placeholder like "[Your Name]"
 or "[Sender]" in the final body. If the user's name isn't set and the email
 needs a sign-off, ask them for it rather than inventing or leaving a
 placeholder.
+
+When the user wants to respond to a specific email, use create_reply_draft /
+send_reply (not create_email_draft / send_email) so it stays properly
+threaded in Gmail. Find the message_id with search_emails first if you don't
+already have it.
+
+Notion access is READ-ONLY. You can search the workspace and read page
+content, but you cannot create, edit, or delete anything in Notion. If the
+user asks you to create, write, add to, or modify a Notion page, tell them
+plainly that Notion is read-only in this agent and you can't make that
+change - don't attempt it, don't pretend to, and don't ask clarifying
+questions as if you were about to do it.
+
+Stay on the exact task the user asked for. After any tool call, your
+response must move that specific request forward - answer it, ask the one
+question needed to proceed, or report the result. Do not pivot to a general
+summary of unrelated data a tool happened to return, and do not end with a
+generic "what would you like to do next" unless you've already completed
+what was asked.
+
+If you just asked the user a clarifying question and their next message is a
+short answer, treat it as the answer to YOUR question, applied to the
+original pending task - not as a new, separate request.
+
+Keep responses direct and concise. Never think out loud in your final answer
+(no "wait, let me reconsider", no narrating your own uncertainty about your
+output) - if you're unsure, just ask the user a clear question instead.
 """
 
 # --- Tool schemas (OpenAI-compatible function-calling format, which Ollama supports) ---
@@ -135,6 +174,40 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "create_reply_draft",
+            "description": "Create a draft REPLY to an existing email, properly threaded (correct subject/headers/Gmail thread). Does NOT send. Use this instead of create_email_draft when the user wants to respond to a specific email - get message_id from search_emails or get_recent_emails first.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string", "description": "The Gmail message ID being replied to."},
+                    "body": {"type": "string", "description": "Reply body text."},
+                    "cc": {"type": "array", "items": {"type": "string"}, "description": "Optional CC addresses."},
+                    "bcc": {"type": "array", "items": {"type": "string"}, "description": "Optional BCC addresses."},
+                },
+                "required": ["message_id", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_reply",
+            "description": "Send a REPLY to an existing email immediately, properly threaded - IRREVERSIBLE. Only call after the user has explicitly confirmed the exact body. Get message_id from search_emails or get_recent_emails.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string", "description": "The Gmail message ID being replied to."},
+                    "body": {"type": "string", "description": "Reply body text."},
+                    "cc": {"type": "array", "items": {"type": "string"}, "description": "Optional CC addresses."},
+                    "bcc": {"type": "array", "items": {"type": "string"}, "description": "Optional BCC addresses."},
+                },
+                "required": ["message_id", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_upcoming_events",
             "description": "List upcoming Google Calendar events.",
             "parameters": {
@@ -187,12 +260,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_notion",
-            "description": "Search the user's Notion workspace by keyword/title. Call with NO query (or an empty string) to list every page/database the integration currently has access to - use this for 'what can you see' or 'list all pages' style questions instead of guessing keywords.",
+            "description": "Search the user's Notion workspace by keyword/title. Call with NO query (or an empty string) to list everything the integration can access - most commonly used to find a parent page/database ID before creating something, or to answer 'what can you see' questions. Results are minimal (id/type/title/url) on purpose: use them to pick or reference specific items, not as content to summarize or report back wholesale.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search text. Omit or leave empty to list everything accessible."},
-                    "max_results": {"type": "integer", "description": "Max results to return. Default 20."},
+                    "max_results": {"type": "integer", "description": "Max results to return. Default 15."},
                 },
             },
         },
@@ -232,6 +305,8 @@ TOOL_IMPLS = {
     "search_emails": search_emails,
     "create_email_draft": create_email_draft,
     "send_email": send_email,
+    "create_reply_draft": create_reply_draft,
+    "send_reply": send_reply,
     "list_upcoming_events": list_upcoming_events,
     "create_calendar_event": create_calendar_event,
     "delete_calendar_event": delete_calendar_event,
@@ -239,6 +314,9 @@ TOOL_IMPLS = {
     "get_page_content": get_page_content,
     "search_conversation_log": search_log,
 }
+
+
+THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 def call_ollama(messages: list[dict]) -> dict:
@@ -249,23 +327,70 @@ def call_ollama(messages: list[dict]) -> dict:
             "messages": messages,
             "tools": TOOLS,
             "stream": False,
+            "think": False,  # avoid raw <think> reasoning leaking into output
         },
         timeout=120,
     )
     resp.raise_for_status()
-    return resp.json()
+    result = resp.json()
+
+    # Belt-and-suspenders: strip any stray <think>...</think> block that
+    # slips through regardless (some model/Ollama version combos still emit
+    # it as literal text in content rather than a separate field).
+    content = result.get("message", {}).get("content")
+    if content:
+        result["message"]["content"] = THINK_TAG_RE.sub("", content).strip()
+
+    return result
 
 
 def run_turn(messages: list[dict]) -> str:
     """Runs the tool-calling loop until the model produces a final text answer."""
+    empty_retry_used = False
+
     while True:
-        result = call_ollama(messages)
+        try:
+            result = call_ollama(messages)
+        except requests.exceptions.Timeout:
+            print(
+                "\n[timeout] The model didn't respond within 120s - likely memory "
+                "pressure on this machine. Exiting so you can restart a fresh "
+                "session (long conversation history compounds this).\n"
+            )
+            sys.exit(1)
+        except requests.exceptions.ConnectionError:
+            print("\n[error] Couldn't reach Ollama - make sure it's running (`ollama serve`).\n")
+            sys.exit(1)
+        except requests.exceptions.RequestException as e:
+            print(f"\n[error] Ollama request failed: {e}\n")
+            sys.exit(1)
+
         message = result["message"]
+        tool_calls = message.get("tool_calls")
+        content = (message.get("content") or "").strip()
+
+        # A response with neither a tool call nor any text is a model failure,
+        # not a valid "nothing to say" - don't let it print as silence.
+        if not tool_calls and not content:
+            if not empty_retry_used:
+                empty_retry_used = True
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "(Your last response was empty. Please answer the previous request, or ask a clear question if you need more information.)",
+                    }
+                )
+                continue
+            return (
+                "[The model returned an empty response twice in a row - this can happen "
+                "under memory pressure or after a long conversation. Try rephrasing your "
+                "request, or restart with 'exit' and a fresh session.]"
+            )
+
         messages.append(message)
 
-        tool_calls = message.get("tool_calls")
         if not tool_calls:
-            return message.get("content", "")
+            return content
 
         for call in tool_calls:
             name = call["function"]["name"]
@@ -288,6 +413,19 @@ def run_turn(messages: list[dict]) -> str:
             )
 
 
+MAX_CONTEXT_MESSAGES = 40  # keeps context bounded on limited-RAM machines
+
+
+def _trim_messages(messages: list[dict]) -> list[dict]:
+    """Keeps the system prompt plus only the most recent messages, so a long
+    session doesn't let context (and memory use) grow without bound."""
+    if len(messages) <= MAX_CONTEXT_MESSAGES:
+        return messages
+    system = messages[0]
+    recent = messages[-(MAX_CONTEXT_MESSAGES - 1):]
+    return [system] + recent
+
+
 def main():
     print(f"Local agent ready ({config.OLLAMA_MODEL}). Type 'exit' to quit.\n")
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -300,6 +438,7 @@ def main():
             continue
 
         messages.append({"role": "user", "content": user_input})
+        messages[:] = _trim_messages(messages)
         reply = run_turn(messages)
         print(f"\nagent> {reply}\n")
         log_interaction(user_input, reply)

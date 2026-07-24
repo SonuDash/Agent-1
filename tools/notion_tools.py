@@ -20,12 +20,17 @@ def _get_client() -> Client:
     return _client
 
 
-def search_notion(query: str = "", max_results: int = 20) -> list[dict]:
+def search_notion(query: str = "", max_results: int = 15) -> list[dict]:
     """Search page/database titles and content across the connected workspace.
 
     Passing an empty query (the default) returns every page/database the
-    integration currently has access to \u2014 useful for "what can you see"
-    style questions.
+    integration currently has access to - useful for "what can you see"
+    style questions, or for finding a parent page/database ID before
+    creating something.
+
+    Returns only id/type/title/url per result (deliberately minimal) so the
+    model uses this to pick a specific item, not to write a report about the
+    whole workspace.
     """
     client = _get_client()
     kwargs = {"page_size": max_results}
@@ -48,7 +53,6 @@ def search_notion(query: str = "", max_results: int = 20) -> list[dict]:
                 "type": item["object"],
                 "title": title,
                 "url": item.get("url", ""),
-                "last_edited": item.get("last_edited_time", ""),
             }
         )
     return results

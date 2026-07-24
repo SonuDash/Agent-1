@@ -3,6 +3,7 @@ can reason over cheaply. Also supports drafting and sending mail."""
 import base64
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
+from email.utils import parseaddr
 
 from google_auth import gmail_service
 
@@ -112,6 +113,72 @@ def send_email(to: list[str], subject: str, body: str, cc: list[str] | None = No
     message = _build_raw_message(to, subject, body, cc, bcc)
     sent = service.users().messages().send(userId="me", body=message).execute()
     return {"sent": True, "message_id": sent["id"], "to": to, "subject": subject}
+
+
+def _build_reply_mime(message_id: str, body: str, cc: list[str] | None = None, bcc: list[str] | None = None) -> dict:
+    """Builds a properly threaded reply: correct 'Re:' subject, In-Reply-To/
+    References headers, and the original Gmail threadId, so it lands in the
+    same conversation thread instead of as a new standalone message."""
+    service = gmail_service()
+    original = (
+        service.users()
+        .messages()
+        .get(
+            userId="me",
+            id=message_id,
+            format="metadata",
+            metadataHeaders=["From", "Message-ID", "Subject", "References"],
+        )
+        .execute()
+    )
+    headers = {h["name"]: h["value"] for h in original["payload"].get("headers", [])}
+
+    to_addr = parseaddr(headers.get("From", ""))[1]
+    if not to_addr:
+        raise RuntimeError(f"Could not determine sender address for message {message_id}")
+
+    subject = headers.get("Subject", "")
+    if not subject.lower().startswith("re:"):
+        subject = f"Re: {subject}"
+
+    orig_msg_id_header = headers.get("Message-ID", "")
+    references = headers.get("References", "")
+    references = f"{references} {orig_msg_id_header}".strip() if references else orig_msg_id_header
+
+    message = MIMEText(body)
+    message["to"] = to_addr
+    message["subject"] = subject
+    if orig_msg_id_header:
+        message["In-Reply-To"] = orig_msg_id_header
+    if references:
+        message["References"] = references
+    if cc:
+        message["cc"] = ", ".join(cc) if isinstance(cc, list) else cc
+    if bcc:
+        message["bcc"] = ", ".join(bcc) if isinstance(bcc, list) else bcc
+
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    return {"raw": raw, "threadId": original["threadId"]}
+
+
+def create_reply_draft(message_id: str, body: str, cc: list[str] | None = None, bcc: list[str] | None = None) -> dict:
+    """Create a draft reply to an existing email, properly threaded (correct
+    subject, headers, and Gmail thread). Does NOT send - the user reviews and
+    sends it themselves. Get message_id from search_emails or get_recent_emails."""
+    service = gmail_service()
+    message = _build_reply_mime(message_id, body, cc, bcc)
+    draft = service.users().drafts().create(userId="me", body={"message": message}).execute()
+    return {"draft_id": draft["id"], "in_reply_to": message_id}
+
+
+def send_reply(message_id: str, body: str, cc: list[str] | None = None, bcc: list[str] | None = None) -> dict:
+    """Send a reply to an existing email immediately, properly threaded. This
+    is IRREVERSIBLE. Only call after the user has explicitly confirmed the
+    exact body. Get message_id from search_emails or get_recent_emails."""
+    service = gmail_service()
+    message = _build_reply_mime(message_id, body, cc, bcc)
+    sent = service.users().messages().send(userId="me", body=message).execute()
+    return {"sent": True, "message_id": sent["id"], "in_reply_to": message_id}
 
 
 if __name__ == "__main__":
