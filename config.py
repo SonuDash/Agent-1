@@ -13,6 +13,7 @@ GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json
 GOOGLE_TOKEN_PATH = os.getenv("GOOGLE_TOKEN_PATH", "token.json")
 
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata")
+USER_NAME = os.getenv("USER_NAME", "")
 
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",

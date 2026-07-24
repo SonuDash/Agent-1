@@ -18,6 +18,7 @@ TODAY = datetime.now().strftime("%Y-%m-%d %A")
 
 SYSTEM_PROMPT = f"""You are a personal local assistant running on the user's own machine.
 Today's date is {TODAY}. The user's timezone is {config.TIMEZONE}.
+The user's name is {config.USER_NAME or "not set - ask them for their name if you need to sign an email"}.
 
 You have tools to read their Gmail, read/create Google Calendar events, and
 search/read their Notion workspace. Use tools whenever a question needs
@@ -55,6 +56,12 @@ the user has explicitly told you to send it, and even then, show the exact
 recipient, subject, and body first and get a clear "yes, send it" before
 calling send_email - unless they already confirmed that exact content
 earlier in this same conversation.
+
+When drafting or sending emails on the user's behalf, sign off using the
+user's real name given above - NEVER leave a placeholder like "[Your Name]"
+or "[Sender]" in the final body. If the user's name isn't set and the email
+needs a sign-off, ask them for it rather than inventing or leaving a
+placeholder.
 """
 
 # --- Tool schemas (OpenAI-compatible function-calling format, which Ollama supports) ---
