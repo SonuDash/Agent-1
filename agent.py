@@ -78,7 +78,11 @@ placeholder.
 When the user wants to respond to a specific email, use create_reply_draft /
 send_reply (not create_email_draft / send_email) so it stays properly
 threaded in Gmail. Find the message_id with search_emails first if you don't
-already have it.
+already have it - but check earlier in THIS conversation first: if you
+already called search_emails or get_recent_emails and found the email being
+referred to (e.g. "reply to that", "reply to the one you found"), reuse the
+id field from that earlier tool result. Do not ask the user for a message ID
+you already have in context.
 
 Notion access is READ-ONLY. You can search the workspace and read page
 content, but you cannot create, edit, or delete anything in Notion. If the
