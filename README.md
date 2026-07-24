@@ -81,9 +81,16 @@ cp .env.example .env
 6. First run of the agent will pop open a browser window to authorize - this creates
    a `token.json` that's reused after that (no repeated logins)
 
-Scopes used (edit in `config.py` if you want write-access to email too):
-- `gmail.readonly`
-- `calendar` (read/write, needed to create events)
+Scopes used (edit `GOOGLE_SCOPES` in `config.py` if you want to change these):
+- `gmail.readonly` - read email
+- `gmail.compose` / `gmail.send` - draft and send email on your behalf
+- `calendar` (read/write, needed to create/delete events)
+
+**If you're updating from an earlier version of this project** that only had
+`gmail.readonly`: delete `token.json` and re-run the agent so it re-authorizes
+with the new scopes. Google won't silently grant new permissions to an
+existing token - you'll get permission errors on drafting/sending until you
+do this.
 
 ## 4. Notion setup
 

@@ -9,7 +9,7 @@ from datetime import datetime
 import requests
 
 import config
-from tools.gmail_tools import get_recent_emails, search_emails
+from tools.gmail_tools import get_recent_emails, search_emails, create_email_draft, send_email
 from tools.calendar_tools import list_upcoming_events, create_calendar_event, delete_calendar_event
 from tools.notion_tools import search_notion, get_page_content
 from storage import log_interaction, search_log
@@ -47,6 +47,14 @@ you're about to delete and ask the user to confirm, unless they already gave
 an unambiguous, explicit instruction naming that exact event. If more than
 one event could match what they described, list the candidates and ask which
 one instead of guessing.
+
+Sending email is irreversible - the recipient gets it immediately and it
+cannot be recalled. Default to create_email_draft, not send_email, whenever
+the user asks you to write/compose/draft an email. Only call send_email if
+the user has explicitly told you to send it, and even then, show the exact
+recipient, subject, and body first and get a clear "yes, send it" before
+calling send_email - unless they already confirmed that exact content
+earlier in this same conversation.
 """
 
 # --- Tool schemas (OpenAI-compatible function-calling format, which Ollama supports) ---
@@ -84,6 +92,42 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "create_email_draft",
+            "description": "Create a draft email in Gmail. Does NOT send it - the user reviews and sends it themselves. This is the safe default for anything email-composition related; prefer it over send_email unless the user explicitly says to send immediately.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "array", "items": {"type": "string"}, "description": "Recipient email address(es)."},
+                    "subject": {"type": "string", "description": "Email subject line."},
+                    "body": {"type": "string", "description": "Email body text."},
+                    "cc": {"type": "array", "items": {"type": "string"}, "description": "Optional CC addresses."},
+                    "bcc": {"type": "array", "items": {"type": "string"}, "description": "Optional BCC addresses."},
+                },
+                "required": ["to", "subject", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_email",
+            "description": "Send an email immediately - IRREVERSIBLE, the recipient gets it right away. Only call this after the user has explicitly confirmed the exact recipient, subject, and body in this conversation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "array", "items": {"type": "string"}, "description": "Recipient email address(es)."},
+                    "subject": {"type": "string", "description": "Email subject line."},
+                    "body": {"type": "string", "description": "Email body text."},
+                    "cc": {"type": "array", "items": {"type": "string"}, "description": "Optional CC addresses."},
+                    "bcc": {"type": "array", "items": {"type": "string"}, "description": "Optional BCC addresses."},
+                },
+                "required": ["to", "subject", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_upcoming_events",
             "description": "List upcoming Google Calendar events.",
             "parameters": {
@@ -98,7 +142,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "create_calendar_event",
-            "description": "Create a new Google Calendar event.",
+            "description": "Create a new Google Calendar event, optionally recurring. To make it recurring, set recurrence_freq (DAILY/WEEKLY/MONTHLY/YEARLY); leave it unset for a one-off event.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -108,6 +152,11 @@ TOOLS = [
                     "description": {"type": "string", "description": "Optional event description."},
                     "attendees": {"type": "array", "items": {"type": "string"}, "description": "Optional list of attendee emails."},
                     "location": {"type": "string", "description": "Optional location."},
+                    "recurrence_freq": {"type": "string", "enum": ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"], "description": "Set to make the event recurring. Omit for a one-off event."},
+                    "recurrence_interval": {"type": "integer", "description": "Repeat every N periods, e.g. 2 = every other week. Default 1."},
+                    "recurrence_count": {"type": "integer", "description": "Stop after N occurrences."},
+                    "recurrence_until": {"type": "string", "description": "Stop after this date, ISO format e.g. 2026-12-31. Use instead of recurrence_count, not both."},
+                    "recurrence_days": {"type": "array", "items": {"type": "string", "enum": ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]}, "description": "For weekly recurrence, which days e.g. ['MO','WE','FR']."},
                 },
                 "required": ["summary", "start_iso", "end_iso"],
             },
@@ -174,6 +223,8 @@ TOOLS = [
 TOOL_IMPLS = {
     "get_recent_emails": get_recent_emails,
     "search_emails": search_emails,
+    "create_email_draft": create_email_draft,
+    "send_email": send_email,
     "list_upcoming_events": list_upcoming_events,
     "create_calendar_event": create_calendar_event,
     "delete_calendar_event": delete_calendar_event,
