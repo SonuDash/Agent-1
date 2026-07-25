@@ -5,106 +5,53 @@ Run: python agent.py
 """
 import json
 import re
-import sys
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 
 import config
-from tools.gmail_tools import get_recent_emails, search_emails, create_email_draft, send_email, create_reply_draft, send_reply
-from tools.calendar_tools import list_upcoming_events, create_calendar_event, delete_calendar_event
+from tools.gmail_tools import get_recent_emails, search_emails, find_emails_from, create_email_draft, send_email, create_reply_draft, send_reply
+from tools.calendar_tools import list_upcoming_events, create_calendar_event, update_calendar_event, delete_calendar_event
 from tools.notion_tools import search_notion, get_page_content
 from storage import log_interaction, search_log
 
-TODAY = datetime.now().strftime("%Y-%m-%d %A")
+NOW = datetime.now(ZoneInfo(config.TIMEZONE))
+TODAY = NOW.strftime("%Y-%m-%d %A")
+CURRENT_TIME = NOW.strftime("%H:%M %Z")
 
-SYSTEM_PROMPT = f"""You are a personal local assistant running on the user's own machine.
-Today's date is {TODAY}. The user's timezone is {config.TIMEZONE}.
-The user's name is {config.USER_NAME or "not set - ask them for their name if you need to sign an email"}.
+SYSTEM_PROMPT = f"""You are a local personal assistant. Be accurate, cautious, and concise.
 
-You have tools to read their Gmail, read/create Google Calendar events, and
-search/read their Notion workspace. Use tools whenever a question needs
-real data instead of guessing. When creating calendar events, always confirm
-the exact date/time you're about to book if the user's phrasing was
-ambiguous (e.g. "next Tuesday").
+Context: today is {TODAY}; current time is {CURRENT_TIME}; timezone: {config.TIMEZONE}; user name: {config.USER_NAME or "unknown"}.
 
-When summarizing email into action items, be concise: one line per action
-item, note who it's from and any deadline mentioned. Skip newsletters,
-notifications, and anything that isn't actually actionable.
+SOURCE OF TRUTH
+- Use tool results for Gmail, Calendar, and Notion facts. Never invent, infer, or fill in missing details.
+- Treat email addresses, IDs, exact names, dates/times, amounts, and account details as unknown unless the user or a tool provided the exact value. Look them up with a tool or ask.
+- Answer about a specific item only when a tool result actually matches it. Otherwise say it was not found and state what you searched.
+- Report an action as completed only after its exact tool call succeeds in this conversation. On failure, report the error; never fabricate confirmation, IDs, or outcomes.
 
-For Notion: if you need to see everything accessible, or a keyword search
-comes up empty, call search_notion with no query instead of guessing more
-keywords - that lists everything the integration can currently see in one
-call.
+EMAIL
+- For a sender named without an address, call find_emails_from first. Never construct an address.
+- Use create_email_draft for compose/write/draft requests. Send only after the user explicitly confirms the exact recipient, subject, and body in this conversation.
+- Use create_reply_draft or send_reply for replies. Reuse a known message_id; otherwise find the message first.
+- Use the user's real name for a sign-off. If it is unknown, ask instead of using a placeholder.
+- For action-item summaries: one actionable line each, with sender and deadline; omit newsletters and notifications.
 
-Grounding rule (search) - follow this strictly: if the user asks about a
-specific email, event, or page and your tool results do NOT contain
-something that actually matches (matching subject, sender, or title), say
-plainly that you couldn't find it and show what you searched for. NEVER
-summarize or describe a different, unrelated item as if it were the one
-requested. Getting this wrong is worse than saying "not found."
+CALENDAR
+- If a date or time is ambiguous, ask for the exact date/time before creating an event.
+- After creation, report only the start and end returned by the calendar tool.
+- To change an event's time, list matching events and use update_calendar_event; never create a replacement and delete the old event.
+- Before deleting, identify the exact event (title and date/time) and obtain confirmation. If several events match, list them and ask which one.
 
-Grounding rule (actions) - follow this even more strictly: NEVER tell the
-user something was created, sent, deleted, or updated unless you can see the
-actual successful result of that exact tool call earlier in THIS
-conversation. If you have not called send_email, create_calendar_event,
-delete_calendar_event, etc. and gotten a success result back, you have not
-done it - don't say you have, don't invent an ID or confirmation detail for
-it, and don't describe what "would have" happened as if it happened. If a
-tool call errored, say so plainly and show the error, don't paper over it
-with a fabricated success message.
+NOTION
+- Notion is read-only: search and read only. State this plainly if asked to modify it.
+- If a Notion search is empty or you need all accessible pages, call search_notion with no query.
 
-Deleting calendar events is destructive and cannot be undone. Before calling
-delete_calendar_event, always state clearly which event (title + date/time)
-you're about to delete and ask the user to confirm, unless they already gave
-an unambiguous, explicit instruction naming that exact event. If more than
-one event could match what they described, list the candidates and ask which
-one instead of guessing.
-
-Sending email is irreversible - the recipient gets it immediately and it
-cannot be recalled. Default to create_email_draft, not send_email, whenever
-the user asks you to write/compose/draft an email. Only call send_email if
-the user has explicitly told you to send it, and even then, show the exact
-recipient, subject, and body first and get a clear "yes, send it" before
-calling send_email - unless they already confirmed that exact content
-earlier in this same conversation.
-
-When drafting or sending emails on the user's behalf, sign off using the
-user's real name given above - NEVER leave a placeholder like "[Your Name]"
-or "[Sender]" in the final body. If the user's name isn't set and the email
-needs a sign-off, ask them for it rather than inventing or leaving a
-placeholder.
-
-When the user wants to respond to a specific email, use create_reply_draft /
-send_reply (not create_email_draft / send_email) so it stays properly
-threaded in Gmail. Find the message_id with search_emails first if you don't
-already have it - but check earlier in THIS conversation first: if you
-already called search_emails or get_recent_emails and found the email being
-referred to (e.g. "reply to that", "reply to the one you found"), reuse the
-id field from that earlier tool result. Do not ask the user for a message ID
-you already have in context.
-
-Notion access is READ-ONLY. You can search the workspace and read page
-content, but you cannot create, edit, or delete anything in Notion. If the
-user asks you to create, write, add to, or modify a Notion page, tell them
-plainly that Notion is read-only in this agent and you can't make that
-change - don't attempt it, don't pretend to, and don't ask clarifying
-questions as if you were about to do it.
-
-Stay on the exact task the user asked for. After any tool call, your
-response must move that specific request forward - answer it, ask the one
-question needed to proceed, or report the result. Do not pivot to a general
-summary of unrelated data a tool happened to return, and do not end with a
-generic "what would you like to do next" unless you've already completed
-what was asked.
-
-If you just asked the user a clarifying question and their next message is a
-short answer, treat it as the answer to YOUR question, applied to the
-original pending task - not as a new, separate request.
-
-Keep responses direct and concise. Never think out loud in your final answer
-(no "wait, let me reconsider", no narrating your own uncertainty about your
-output) - if you're unsure, just ask the user a clear question instead.
+WORKFLOW
+- Stay on the user's request. After a tool call, answer it, report the result, or ask the one needed question.
+- A short reply after your question answers the pending request unless it clearly starts a new task.
+- When an action is authorized and all arguments are known, call its tool in the same response. Never say that you will perform an action later or that it is in progress without calling a tool.
+- Do not reveal chain-of-thought. If uncertain, ask a direct question.
 """
 
 # --- Tool schemas (OpenAI-compatible function-calling format, which Ollama supports) ---
@@ -112,12 +59,28 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "search_emails",
-            "description": "Search Gmail directly using Gmail search syntax - use this whenever the user names a specific email, subject, or sender. Examples: subject:\"exact phrase\", from:someone@example.com, or plain keywords. Prefer this over get_recent_emails for anything specific; get_recent_emails only returns a generic recent time window and will miss older or unmatched emails.",
+            "name": "find_emails_from",
+            "description": "Find emails from a specific sender, newest first - use this FIRST whenever the user asks about email(s) from a particular person/company, e.g. 'any new mail from X', 'most recent email from Y'. It searches all mail unless you set days for a requested recent period. Pass the sender exactly as the user said it (a name, company, or full email address - whatever you have). Do NOT try to guess, construct, or spell out a domain/email address yourself.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Gmail search query, e.g. subject:\"Streamable HTTP server\""},
+                    "sender": {"type": "string", "description": "The sender as the user described them - a name, company, or full email address. Pass it through as-is, don't modify or guess at it."},
+                    "days": {"type": "integer", "description": "Optional: how many days back to look. Omit unless the user requests a recent period; the default searches all mail."},
+                    "max_results": {"type": "integer", "description": "Max results. Default 5."},
+                },
+                "required": ["sender"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_emails",
+            "description": "Search Gmail directly using Gmail search syntax - for anything find_emails_from doesn't cover (e.g. searching by subject, or combining multiple conditions). For a simple 'emails from X' request, use find_emails_from instead - it's safer since it doesn't require you to compose Gmail syntax by hand. If you do use this tool, ONLY use these real Gmail operators, combined with spaces (implicit AND): from:someone@example.com, subject:\"exact phrase\", newer_than:7d, older_than:1y, is:unread, has:attachment. Do NOT invent other operators or combine two operators into one fused string (e.g. there is no 'is:newer_than:' - that does not exist, use them as separate space-separated terms). Put max_results in its own max_results parameter, NEVER as text inside the query string. Results are already sorted newest-first - for 'most recent' or 'latest' requests, the FIRST result in the list is the answer; do not try to compare date strings yourself.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Gmail search query using real operators only (from:, subject:, newer_than:, older_than:, is:, has:). Never put max_results or other parameters inside this string."},
                     "max_results": {"type": "integer", "description": "Max results. Default 10."},
                 },
                 "required": ["query"],
@@ -128,7 +91,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_recent_emails",
-            "description": "Fetch recent emails from Gmail to find action items or check for messages from someone.",
+            "description": "Fetch recent emails from Gmail to find action items or check for messages from someone. Results are already sorted newest-first - the FIRST result is the most recent.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -249,8 +212,24 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "update_calendar_event",
+            "description": "Reschedule one existing Google Calendar event. Use this for any change of time; never create a replacement event. First call list_upcoming_events and use the selected event's id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string", "description": "Event ID from list_upcoming_events."},
+                    "new_start_iso": {"type": "string", "description": "New start time in ISO 8601."},
+                    "new_end_iso": {"type": "string", "description": "New end time in ISO 8601."},
+                },
+                "required": ["event_id", "new_start_iso", "new_end_iso"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "delete_calendar_event",
-            "description": "Delete a calendar event by its event_id. If you only know the event's title or time, call list_upcoming_events first to find the matching event_id - never guess an ID or delete an event without a confirmed match.",
+            "description": "Delete one calendar event. First call list_upcoming_events, identify the exact event to the user, and obtain their confirmation. Then pass its id.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -307,12 +286,14 @@ TOOLS = [
 TOOL_IMPLS = {
     "get_recent_emails": get_recent_emails,
     "search_emails": search_emails,
+    "find_emails_from": find_emails_from,
     "create_email_draft": create_email_draft,
     "send_email": send_email,
     "create_reply_draft": create_reply_draft,
     "send_reply": send_reply,
     "list_upcoming_events": list_upcoming_events,
     "create_calendar_event": create_calendar_event,
+    "update_calendar_event": update_calendar_event,
     "delete_calendar_event": delete_calendar_event,
     "search_notion": search_notion,
     "get_page_content": get_page_content,
@@ -322,7 +303,6 @@ TOOL_IMPLS = {
 
 THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
-
 def call_ollama(messages: list[dict]) -> dict:
     resp = requests.post(
         f"{config.OLLAMA_HOST}/api/chat",
@@ -331,103 +311,81 @@ def call_ollama(messages: list[dict]) -> dict:
             "messages": messages,
             "tools": TOOLS,
             "stream": False,
-            "think": False,  # avoid raw <think> reasoning leaking into output
+            "think": False,
         },
         timeout=120,
     )
     resp.raise_for_status()
     result = resp.json()
-
-    # Belt-and-suspenders: strip any stray <think>...</think> block that
-    # slips through regardless (some model/Ollama version combos still emit
-    # it as literal text in content rather than a separate field).
     content = result.get("message", {}).get("content")
     if content:
         result["message"]["content"] = THINK_TAG_RE.sub("", content).strip()
-
     return result
 
 
 def run_turn(messages: list[dict]) -> str:
-    """Runs the tool-calling loop until the model produces a final text answer."""
+    """Run model/tool turns until the model returns a final answer."""
     empty_retry_used = False
 
     while True:
         try:
             result = call_ollama(messages)
         except requests.exceptions.Timeout:
-            print(
-                "\n[timeout] The model didn't respond within 120s - likely memory "
-                "pressure on this machine. Exiting so you can restart a fresh "
-                "session (long conversation history compounds this).\n"
-            )
-            sys.exit(1)
+            return "[The local model timed out before completing the request.]"
         except requests.exceptions.ConnectionError:
-            print("\n[error] Couldn't reach Ollama - make sure it's running (`ollama serve`).\n")
-            sys.exit(1)
-        except requests.exceptions.RequestException as e:
-            print(f"\n[error] Ollama request failed: {e}\n")
-            sys.exit(1)
+            return "[Couldn't reach Ollama. Make sure it is running.]"
+        except requests.exceptions.RequestException as error:
+            return f"[Ollama request failed: {error}]"
 
         message = result["message"]
         tool_calls = message.get("tool_calls")
         content = (message.get("content") or "").strip()
 
-        # A response with neither a tool call nor any text is a model failure,
-        # not a valid "nothing to say" - don't let it print as silence.
         if not tool_calls and not content:
-            if not empty_retry_used:
-                empty_retry_used = True
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": "(Your last response was empty. Please answer the previous request, or ask a clear question if you need more information.)",
-                    }
-                )
-                continue
-            return (
-                "[The model returned an empty response twice in a row - this can happen "
-                "under memory pressure or after a long conversation. Try rephrasing your "
-                "request, or restart with 'exit' and a fresh session.]"
+            if empty_retry_used:
+                return "[The model returned an empty response twice. Please try again.]"
+            empty_retry_used = True
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Your response was empty. Continue the pending request. "
+                        "If the task is an authorized action and its arguments are known, "
+                        "call the appropriate tool now; otherwise ask one clear question."
+                    ),
+                }
             )
+            continue
 
         messages.append(message)
-
         if not tool_calls:
             return content
 
         for call in tool_calls:
             name = call["function"]["name"]
             args = call["function"].get("arguments", {})
-            if isinstance(args, str):
-                args = json.loads(args)
-
-            print(f"  [tool] {name}({args})")
             try:
-                fn = TOOL_IMPLS[name]
-                output = fn(**args)
-            except Exception as e:
-                output = {"error": str(e)}
+                if isinstance(args, str):
+                    args = json.loads(args)
+                if not isinstance(args, dict):
+                    raise ValueError("tool arguments must be a JSON object")
+                tool = TOOL_IMPLS.get(name)
+                if tool is None:
+                    raise ValueError(f"unknown tool: {name}")
+                print(f"  [tool] {name}({args})")
+                output = tool(**args)
+            except Exception as error:
+                output = {"error": str(error), "tool": name}
+            messages.append({"role": "tool", "content": json.dumps(output, default=str)})
 
-            messages.append(
-                {
-                    "role": "tool",
-                    "content": json.dumps(output, default=str),
-                }
-            )
 
-
-MAX_CONTEXT_MESSAGES = 40  # keeps context bounded on limited-RAM machines
+MAX_CONTEXT_MESSAGES = 40
 
 
 def _trim_messages(messages: list[dict]) -> list[dict]:
-    """Keeps the system prompt plus only the most recent messages, so a long
-    session doesn't let context (and memory use) grow without bound."""
     if len(messages) <= MAX_CONTEXT_MESSAGES:
         return messages
-    system = messages[0]
-    recent = messages[-(MAX_CONTEXT_MESSAGES - 1):]
-    return [system] + recent
+    return [messages[0]] + messages[-(MAX_CONTEXT_MESSAGES - 1):]
 
 
 def main():

@@ -1,9 +1,10 @@
 """Gmail read tools: fetch recent/unread emails in a compact form the LLM
 can reason over cheaply. Also supports drafting and sending mail."""
 import base64
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 
 from google_auth import gmail_service
 
@@ -36,6 +37,9 @@ def get_recent_emails(hours: int = 24, max_results: int = 25, unread_only: bool 
     return _fetch_by_query(query, max_results)
 
 
+_EMBEDDED_PARAM_RE = re.compile(r"\b(max_results|limit)\s*[:=]\s*\d+\b", re.IGNORECASE)
+
+
 def search_emails(query: str, max_results: int = 10) -> list[dict]:
     """Search Gmail directly using Gmail search syntax, e.g. subject:"exact phrase",
     from:someone@example.com, or plain keywords. Use this instead of
@@ -43,6 +47,36 @@ def search_emails(query: str, max_results: int = 10) -> list[dict]:
     subject - get_recent_emails only returns a generic recent window and
     will miss anything older or not in that window.
     """
+    # Defensive: a model occasionally embeds "max_results=N" as literal text
+    # inside the query string instead of passing it as its own parameter.
+    # Gmail then searches for that literal text and finds nothing. Strip it
+    # out rather than let a malformed query silently return zero results.
+    cleaned_query = _EMBEDDED_PARAM_RE.sub("", query).strip()
+    return _fetch_by_query(cleaned_query, max_results)
+
+
+def find_emails_from(sender: str, days: int | None = None, max_results: int = 5) -> list[dict]:
+    """Find emails from a specific sender, newest first. Pass whatever the user
+    actually gave you literally - a full email address if they gave one, or
+    just a name/company if that's all you have. Do NOT guess or construct a
+    domain/email address yourself (e.g. don't turn "Skydo" into
+    "skydo.com" or similar) - this function builds a correct, valid Gmail
+    query from the raw text for you, so there's nothing to compose or guess.
+
+    By default the search covers all available mail. Set days only when the
+    user explicitly asks for a recent time period.
+    """
+    sender = sender.strip()
+    date_filter = f" newer_than:{days}d" if days else ""
+    if "@" in sender:
+        # A real address was given - search it as the sender directly.
+        query = f"from:{sender}{date_filter}"
+    else:
+        # Only a name/company was given, not an exact address - match it
+        # both as a sender-field match and as a general keyword, since
+        # Gmail's from: operator alone won't reliably match on a display
+        # name or company name without the actual domain.
+        query = f'(from:"{sender}" OR "{sender}"){date_filter}'
     return _fetch_by_query(query, max_results)
 
 
@@ -68,16 +102,34 @@ def _fetch_by_query(query: str, max_results: int) -> list[dict]:
         headers = {h["name"]: h["value"] for h in msg["payload"].get("headers", [])}
         body = _extract_body(msg["payload"])[:MAX_BODY_CHARS]
 
+        raw_date = headers.get("Date", "")
+        try:
+            parsed_date = parsedate_to_datetime(raw_date)
+            if parsed_date and parsed_date.tzinfo is None:
+                parsed_date = parsed_date.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            parsed_date = None
+
         emails.append(
             {
                 "id": msg["id"],
                 "from": headers.get("From", "unknown"),
                 "subject": headers.get("Subject", "(no subject)"),
-                "date": headers.get("Date", ""),
+                # ISO format sorts and compares correctly as plain text, unlike
+                # the raw RFC 2822 header (e.g. "Wed, 22 Jul 2026 10:06:00 +0000")
+                # which does NOT sort correctly lexicographically.
+                "date": parsed_date.isoformat() if parsed_date else raw_date,
                 "snippet": msg.get("snippet", ""),
                 "body": body,
+                "_sort_key": parsed_date,  # internal only, stripped before returning
             }
         )
+
+    # Explicitly sort newest-first ourselves rather than trusting Gmail API's
+    # undocumented default ordering. Entries with an unparseable date sort last.
+    emails.sort(key=lambda e: e["_sort_key"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    for e in emails:
+        del e["_sort_key"]
 
     return emails
 

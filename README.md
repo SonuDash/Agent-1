@@ -10,6 +10,17 @@ It can:
 Nothing leaves your machine except the actual API calls to Google/Notion (which you'd
 be making anyway) - the LLM inference itself is 100% local.
 
+## How the agent works
+
+Qwen is responsible for understanding normal language, choosing a tool, and turning
+the request into structured arguments. The Python tool layer does not try to parse
+phrases such as “sure”, “tomorrow”, or “move it to 8”; it validates structured input,
+calls Gmail, Calendar, or Notion, and returns the API's actual result. The agent only
+reports an action as completed after that result is received.
+
+This keeps the natural-language behavior in one place (the model) and the external
+side effects in small, testable functions.
+
 ---
 
 ## 0. Prerequisites

@@ -1,11 +1,39 @@
 """Google Calendar tools: list upcoming events and create new ones."""
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from google_auth import calendar_service
 import config
 
 VALID_FREQ = {"DAILY", "WEEKLY", "MONTHLY", "YEARLY"}
 VALID_DAYS = {"MO", "TU", "WE", "TH", "FR", "SA", "SU"}
+
+
+def _event_details(event: dict) -> dict:
+    """Normalize Calendar's saved event fields for the model."""
+    return {
+        "summary": event.get("summary", "(no title)"),
+        "start": event.get("start", {}).get("dateTime", event.get("start", {}).get("date")),
+        "end": event.get("end", {}).get("dateTime", event.get("end", {}).get("date")),
+        "timeZone": event.get("start", {}).get("timeZone", config.TIMEZONE),
+    }
+
+
+def _validate_time_range(start_iso: str, end_iso: str) -> None:
+    """Reject malformed or backwards event times before calling Google."""
+    try:
+        start = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("start_iso and end_iso must be ISO 8601 datetimes") from error
+
+    local_zone = ZoneInfo(config.TIMEZONE)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=local_zone)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=local_zone)
+    if end <= start:
+        raise ValueError("end_iso must be later than start_iso")
 
 
 def _build_rrule(
@@ -48,8 +76,9 @@ def _build_rrule(
 def list_upcoming_events(days: int = 1, max_results: int = 15) -> list[dict]:
     """List events between now and `days` days from now."""
     service = calendar_service()
-    now = datetime.utcnow().isoformat() + "Z"
-    end = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
+    local_now = datetime.now(ZoneInfo(config.TIMEZONE))
+    now = local_now.astimezone(timezone.utc).isoformat()
+    end = (local_now + timedelta(days=days)).astimezone(timezone.utc).isoformat()
 
     result = (
         service.events()
@@ -66,12 +95,10 @@ def list_upcoming_events(days: int = 1, max_results: int = 15) -> list[dict]:
 
     events = []
     for e in result.get("items", []):
-        start = e["start"].get("dateTime", e["start"].get("date"))
         events.append(
             {
                 "id": e["id"],
-                "summary": e.get("summary", "(no title)"),
-                "start": start,
+                **_event_details(e),
                 "location": e.get("location", ""),
                 "attendees": [a.get("email") for a in e.get("attendees", [])],
             }
@@ -105,6 +132,7 @@ def create_calendar_event(
       - recurrence_days: for weekly events, which days e.g. ['MO', 'WE', 'FR'].
     Leave recurrence_freq unset for a one-off event.
     """
+    _validate_time_range(start_iso, end_iso)
     service = calendar_service()
 
     event_body = {
@@ -132,7 +160,30 @@ def create_calendar_event(
     return {
         "id": created["id"],
         "htmlLink": created.get("htmlLink"),
+        **_event_details(created),
         "recurring": bool(recurrence_freq),
+    }
+
+
+def update_calendar_event(event_id: str, new_start_iso: str, new_end_iso: str) -> dict:
+    """Reschedule an existing event and return Calendar's saved values."""
+    _validate_time_range(new_start_iso, new_end_iso)
+    service = calendar_service()
+    previous_event = service.events().get(calendarId="primary", eventId=event_id).execute()
+    previous = _event_details(previous_event)
+    updated = service.events().patch(
+        calendarId="primary",
+        eventId=event_id,
+        body={
+            "start": {"dateTime": new_start_iso, "timeZone": config.TIMEZONE},
+            "end": {"dateTime": new_end_iso, "timeZone": config.TIMEZONE},
+        },
+    ).execute()
+    return {
+        "updated": True,
+        "id": event_id,
+        "previous": previous,
+        "current": _event_details(updated),
     }
 
 
@@ -148,8 +199,9 @@ def delete_calendar_event(event_id: str) -> dict:
     the user explicitly asks to delete the whole series, say so clearly in
     your response since this tool as-is only removes single instances."""
     service = calendar_service()
+    event = service.events().get(calendarId="primary", eventId=event_id).execute()
     service.events().delete(calendarId="primary", eventId=event_id).execute()
-    return {"deleted": True, "event_id": event_id}
+    return {"deleted": True, "event_id": event_id, **_event_details(event)}
 
 
 if __name__ == "__main__":
