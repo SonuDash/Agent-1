@@ -16,6 +16,7 @@ def _event_details(event: dict) -> dict:
         "start": event.get("start", {}).get("dateTime", event.get("start", {}).get("date")),
         "end": event.get("end", {}).get("dateTime", event.get("end", {}).get("date")),
         "timeZone": event.get("start", {}).get("timeZone", config.TIMEZONE),
+        "location": event.get("location", ""),
     }
 
 
@@ -183,6 +184,30 @@ def update_calendar_event(event_id: str, new_start_iso: str, new_end_iso: str) -
         "updated": True,
         "id": event_id,
         "previous": previous,
+        "current": _event_details(updated),
+    }
+
+
+def update_calendar_event_venue(event_id: str, venue: str) -> dict:
+    """Change the venue/location of one existing calendar event.
+
+    Get event_id from list_upcoming_events. `venue` may be a physical venue,
+    an online meeting link, or an empty string to clear the current venue.
+    """
+    if not isinstance(venue, str):
+        raise ValueError("venue must be text")
+
+    service = calendar_service()
+    previous_event = service.events().get(calendarId="primary", eventId=event_id).execute()
+    updated = service.events().patch(
+        calendarId="primary",
+        eventId=event_id,
+        body={"location": venue.strip()},
+    ).execute()
+    return {
+        "updated": True,
+        "id": event_id,
+        "previous": _event_details(previous_event),
         "current": _event_details(updated),
     }
 
