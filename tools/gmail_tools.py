@@ -157,14 +157,24 @@ def create_email_draft(to: list[str], subject: str, body: str, cc: list[str] | N
     return {"draft_id": draft["id"], "to": to, "subject": subject}
 
 
-def send_email(to: list[str], subject: str, body: str, cc: list[str] | None = None, bcc: list[str] | None = None) -> dict:
-    """Send an email immediately. This is IRREVERSIBLE - the recipient gets it
-    right away. Only call this after the user has explicitly confirmed the
-    exact recipient, subject, and body."""
+def _send_draft(draft_id: str) -> dict:
+    """Send an existing Gmail draft and return the exact draft metadata."""
     service = gmail_service()
-    message = _build_raw_message(to, subject, body, cc, bcc)
-    sent = service.users().messages().send(userId="me", body=message).execute()
-    return {"sent": True, "message_id": sent["id"], "to": to, "subject": subject}
+    draft = service.users().drafts().get(userId="me", id=draft_id, format="full").execute()
+    headers = {h["name"]: h["value"] for h in draft["message"]["payload"].get("headers", [])}
+    sent = service.users().drafts().send(userId="me", body={"id": draft_id}).execute()
+    return {
+        "sent": True,
+        "draft_id": draft_id,
+        "message_id": sent["id"],
+        "to": headers.get("To", ""),
+        "subject": headers.get("Subject", ""),
+    }
+
+
+def send_email(draft_id: str) -> dict:
+    """Send an existing draft exactly as Gmail has saved it."""
+    return _send_draft(draft_id)
 
 
 def _build_reply_mime(message_id: str, body: str, cc: list[str] | None = None, bcc: list[str] | None = None) -> dict:
@@ -223,14 +233,9 @@ def create_reply_draft(message_id: str, body: str, cc: list[str] | None = None, 
     return {"draft_id": draft["id"], "in_reply_to": message_id}
 
 
-def send_reply(message_id: str, body: str, cc: list[str] | None = None, bcc: list[str] | None = None) -> dict:
-    """Send a reply to an existing email immediately, properly threaded. This
-    is IRREVERSIBLE. Only call after the user has explicitly confirmed the
-    exact body. Get message_id from search_emails or get_recent_emails."""
-    service = gmail_service()
-    message = _build_reply_mime(message_id, body, cc, bcc)
-    sent = service.users().messages().send(userId="me", body=message).execute()
-    return {"sent": True, "message_id": sent["id"], "in_reply_to": message_id}
+def send_reply(draft_id: str) -> dict:
+    """Send an existing threaded reply draft exactly as Gmail saved it."""
+    return _send_draft(draft_id)
 
 
 if __name__ == "__main__":

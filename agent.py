@@ -32,8 +32,8 @@ SOURCE OF TRUTH
 
 EMAIL
 - For a sender named without an address, call find_emails_from first. Never construct an address.
-- Use create_email_draft for compose/write/draft requests. Send only after the user explicitly confirms the exact recipient, subject, and body in this conversation.
-- Use create_reply_draft or send_reply for replies. Reuse a known message_id; otherwise find the message first.
+- Use create_email_draft for new messages and create_reply_draft for replies. Send only after user confirmation.
+- send_email and send_reply require a draft_id and send that exact Gmail draft; never create a new message while sending.
 - Use the user's real name for a sign-off. If it is unknown, ask instead of using a placeholder.
 - For action-item summaries: one actionable line each, with sender and deadline; omit newsletters and notifications.
 
@@ -106,7 +106,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "create_email_draft",
-            "description": "Create a draft email in Gmail. Does NOT send it - the user reviews and sends it themselves. This is the safe default for anything email-composition related; prefer it over send_email unless the user explicitly says to send immediately.",
+            "description": "Create a Gmail draft. The recipient addresses must be exact addresses from the user or Gmail results. Does not send.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -124,17 +124,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "send_email",
-            "description": "Send an email immediately - IRREVERSIBLE, the recipient gets it right away. Only call this after the user has explicitly confirmed the exact recipient, subject, and body in this conversation.",
+            "description": "Send one existing Gmail draft exactly as saved. Call only after user confirmation. Use a draft_id returned by create_email_draft.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "to": {"type": "array", "items": {"type": "string"}, "description": "Recipient email address(es)."},
-                    "subject": {"type": "string", "description": "Email subject line."},
-                    "body": {"type": "string", "description": "Email body text."},
-                    "cc": {"type": "array", "items": {"type": "string"}, "description": "Optional CC addresses."},
-                    "bcc": {"type": "array", "items": {"type": "string"}, "description": "Optional BCC addresses."},
+                    "draft_id": {"type": "string", "description": "ID returned by create_email_draft."},
                 },
-                "required": ["to", "subject", "body"],
+                "required": ["draft_id"],
             },
         },
     },
@@ -159,16 +155,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "send_reply",
-            "description": "Send a REPLY to an existing email immediately, properly threaded - IRREVERSIBLE. Only call after the user has explicitly confirmed the exact body. Get message_id from search_emails or get_recent_emails.",
+            "description": "Send one existing threaded reply draft exactly as saved. Call only after user confirmation. Use a draft_id returned by create_reply_draft.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "message_id": {"type": "string", "description": "The Gmail message ID being replied to."},
-                    "body": {"type": "string", "description": "Reply body text."},
-                    "cc": {"type": "array", "items": {"type": "string"}, "description": "Optional CC addresses."},
-                    "bcc": {"type": "array", "items": {"type": "string"}, "description": "Optional BCC addresses."},
+                    "draft_id": {"type": "string", "description": "ID returned by create_reply_draft."},
                 },
-                "required": ["message_id", "body"],
+                "required": ["draft_id"],
             },
         },
     },
@@ -302,6 +295,74 @@ TOOL_IMPLS = {
 
 
 THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+EMAIL_ADDRESS_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+
+
+def _addresses_in(value: object) -> set[str]:
+    """Extract exact email identifiers from a structured value."""
+    if isinstance(value, str):
+        return {match.group(0).casefold() for match in EMAIL_ADDRESS_RE.finditer(value)}
+    if isinstance(value, list):
+        return set().union(*(_addresses_in(item) for item in value)) if value else set()
+    return set()
+
+
+def _trusted_email_addresses(messages: list[dict]) -> set[str]:
+    """Addresses explicitly supplied by the user or returned by Gmail."""
+    addresses: set[str] = set()
+    for message in messages:
+        if message.get("role") == "user":
+            addresses.update(_addresses_in(message.get("content", "")))
+        elif message.get("role") == "tool":
+            try:
+                result = json.loads(message.get("content", ""))
+            except json.JSONDecodeError:
+                continue
+            entries = result if isinstance(result, list) else [result]
+            for entry in entries:
+                if isinstance(entry, dict):
+                    for field in ("from", "to", "cc", "bcc"):
+                        addresses.update(_addresses_in(entry.get(field, "")))
+    return addresses
+
+
+def _known_draft_ids(messages: list[dict]) -> set[str]:
+    """Draft IDs must come from an actual create-draft tool result."""
+    draft_ids: set[str] = set()
+    for message in messages:
+        if message.get("role") != "tool":
+            continue
+        try:
+            result = json.loads(message.get("content", ""))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(result, dict) and isinstance(result.get("draft_id"), str):
+            draft_ids.add(result["draft_id"])
+    return draft_ids
+
+
+def _validate_email_tool_call(name: str, args: dict, messages: list[dict]) -> None:
+    """Enforce identifier provenance without interpreting user language."""
+    if name == "create_email_draft":
+        requested = set()
+        for field in ("to", "cc", "bcc"):
+            values = args.get(field, [])
+            if not isinstance(values, list):
+                raise ValueError(f"{field} must be a list of email addresses")
+            for address in values:
+                if not isinstance(address, str) or not EMAIL_ADDRESS_RE.fullmatch(address):
+                    raise ValueError(f"{field} contains an invalid email address")
+                requested.add(address.casefold())
+        unknown = requested - _trusted_email_addresses(messages)
+        if unknown:
+            raise ValueError(
+                "recipient address was not supplied by the user or returned by Gmail: "
+                + ", ".join(sorted(unknown))
+            )
+    elif name in {"send_email", "send_reply"}:
+        draft_id = args.get("draft_id")
+        if draft_id not in _known_draft_ids(messages):
+            raise ValueError("draft_id was not returned by a create-draft tool call")
 
 def call_ollama(messages: list[dict]) -> dict:
     resp = requests.post(
@@ -372,6 +433,7 @@ def run_turn(messages: list[dict]) -> str:
                 tool = TOOL_IMPLS.get(name)
                 if tool is None:
                     raise ValueError(f"unknown tool: {name}")
+                _validate_email_tool_call(name, args, messages)
                 print(f"  [tool] {name}({args})")
                 output = tool(**args)
             except Exception as error:
