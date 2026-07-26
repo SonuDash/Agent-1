@@ -443,7 +443,7 @@ def run_turn(messages: list[dict]) -> str:
 
         if not tool_calls and not content:
             if empty_retry_used:
-                return "[The model returned an empty response twice. Please try again.]"
+                return "Intelligent Assistant had a fallout with the tools lol"
             empty_retry_used = True
             messages.append(
                 {
