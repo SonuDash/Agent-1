@@ -150,47 +150,13 @@ can say things like:
 The DB is gitignored (`agent_log.db`) since it's your personal query history,
 not something to commit.
 
-## 7. Automate the daily briefing (launchd)
 
-Create `~/Library/LaunchAgents/com.local.qwenagent.briefing.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.local.qwenagent.briefing</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/absolute/path/to/qwen-agent/venv/bin/python</string>
-    <string>/absolute/path/to/qwen-agent/daily_briefing.py</string>
-  </array>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key><integer>7</integer>
-    <key>Minute</key><integer>30</integer>
-  </dict>
-  <key>StandardOutPath</key><string>/tmp/qwenagent.log</string>
-  <key>StandardErrorPath</key><string>/tmp/qwenagent.err</string>
-</dict>
-</plist>
-```
-
-Load it:
-```bash
-launchctl load ~/Library/LaunchAgents/com.local.qwenagent.briefing.plist
-```
-
-Every morning at 7:30am it'll write your briefing to `/tmp/qwenagent.log`. You can
-swap the last line of `daily_briefing.py` for a `osascript` call to fire a native
-macOS notification instead of just printing, if you want.
 
 ## Project layout
 
 ```
 qwen-agent/
 ├── agent.py              # interactive CLI agent w/ tool-calling loop
-├── daily_briefing.py     # standalone script: email → action items
 ├── storage.py             # SQLite logger for past queries/responses
 ├── config.py              # env/config loader
 ├── google_auth.py          # OAuth flow for Gmail + Calendar
